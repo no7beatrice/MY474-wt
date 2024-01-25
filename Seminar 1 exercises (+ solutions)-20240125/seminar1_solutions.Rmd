@@ -1,0 +1,288 @@
+# MY474 -- Seminar 1 (complete solution)
+## Dr Thomas Robinson | WT 2024
+
+## Defining a data and prediction function
+
+In this seminar we will focus on a simple binary classification context, in which we use stochastic gradient descent to estimate coefficient values from a logistic model. 
+
+First, we need to some generate some data.
+
+Using the code block below, create a function that takes a single argument (`n`), and returns a data.frame object with $n$ observations and three variables with the following properties:
+  * `X0`: always takes the value 1
+  * `X1`: random numbers drawn from a uniform distribution between -5 and 5
+  * `X2`: random numbers drawn from a uniform distribution between -2 and 2
+
+```{r}
+set.seed(89)
+
+genX <- function(n) {
+  return(
+    data.frame(X0 = 1,
+               X1 = runif(n,-5,5),
+               X2 = runif(n,-2,2))
+  )
+}
+```
+
+Next, for every training observation, we need a binary outcome! Let's write another function that takes a data frame $X$ (of the dimensions created using `genX`) as its only argument, and performs the following steps:
+
+  1. Defines a linear relationship where $Ylin = 3*X_0 + 1*X_1 - 2*X_2 + e$, where e ~ N(0,0.05).
+  2. Transforms this linear space to the 0-1 interval using the sigmoid function
+  3. Finally, using the `rbinom()` function to convert these probabilities into binary values
+
+The function should return the resulting vector.
+
+```{r}
+
+genY <- function(X) {
+  Ylin <- 3*X$X0 + 1*X$X1 - 2*X$X2 + rnorm(nrow(X),0,0.05) 
+  Yp <- 1/(1+exp(-Ylin))
+  Y <- rbinom(nrow(X),1,Yp)
+  return(Y)
+}
+
+```
+
+Finally, let's define our own prediction function that yields the predicted probability of an observation, *given* a set of coefficients:
+
+```{r}
+# Custom function to get logistic yhat predictions
+predict_row <- function(row, coefficients) {
+  pred_terms <- row*coefficients # get the values of the individual linear terms
+  yhat <- sum(pred_terms) # sum these up (i.e. \beta_0 + \beta_1X_1 + ...
+  return(1/(1+exp(-yhat))) # convert to probabilities
+}
+```
+
+Now we have the apparatus to start thinking about *learning* the model parameters from the data!
+
+Just before we begin, let's use our functions to generate some data. Create a data frame called `X` with 1000 observations, and a corresponding vector of probabilities called `y`.
+
+```{r}
+X <- genX(1000)
+y <- genY(X)
+```
+
+## Naive approach: a random guess!
+
+As a first approach, we could just simply try guess the parameters of our model:
+
+```{r}
+# "random" guess
+coef_guess <- c(0,0.5,1)
+yhat_guess <- apply(X, 1, predict_row, coefficients = coef_guess)
+```
+
+How good is our guess? 
+
+Write two more functions that return the mean squared error and negative log-likelihood, respectively, of predicted values against the known values. Each function should take the same two arguments (`ytrue` and `yhat`).
+
+```{r}
+MSE <- function(ytrue, yhat) {
+  return(mean((ytrue-yhat)^2))
+}
+
+NLL <- function(ytrue, yhat) {
+  return(-sum(log(
+    (yhat^ytrue)*((1-yhat)^(1-ytrue))
+  )))
+}
+
+```
+
+Now, using your functions, calculate the error summaries from our random guess of the parameters:
+```{r}
+nll_guess <- NLL(y, yhat_guess)
+print(paste0("Neg. Log. Likelihood: ", nll_guess))
+
+mse_guess <- MSE(y, yhat_guess)
+print(paste0("Mean Squared Error: ", mse_guess))
+```
+
+Let's compare these to the theoretical *true* model where we know the coefficients:
+
+```{r}
+coef_true <- c(3,1,-2)
+yhat_true <- apply(X, 1, predict_row, coefficients = coef_true)
+nll_true <- NLL(y, yhat_true)
+mse_true <- MSE(y, yhat_true)
+
+print(paste0("Neg. Log. Likelihood: ", nll_true))
+print(paste0("Mean Squared Error: ", mse_true))
+```
+
+So, in both cases, the error statistics are *much* smaller, so we can conclude our naive approach is quite bad (phew!)
+
+## A logistic regression training algorithm
+
+Next, let's consider writing a function to implement logistic regression estimation using *stochastic gradient descent*. The basic logic of our estimator is going to be as follows:
+
+(C) | for b = 1 to epochs
+      (B) for i = 1 to N [shuffled]:
+          (A) let X_i be the row-vector of feature values
+           |  for k in 1 to K (the number of predictors):
+           |      let q_ik be the partial derivative of beta_k at X_i
+           |      update the parameter estimate by changing it by -lambda*q_ik
+
+We'll build this function in steps (A, B, then C), and then piece it all together.
+
+### Gradient descent on a single observation
+
+First, let's consider the very inner component: calculating the gradient at a given point, and updating the parameters. 
+
+We'll assume our coefficients are all set to 0 in the first instance, and I've provided a reasonable first learning rate. 
+
+While we're building out our code, let's also just use the first row of data (i.e. $i = 1$).
+
+```{r}
+# for sake of testing
+i = 1 
+coefs = c(0,0,0) # (beta_0,beta_1,beta_2)
+l_rate = 0.01
+
+# extract the row of data we are considering, and convert it to a numeric vector
+row_vec <- as.numeric(X[i,]) # make row easier to handle
+
+# predict the outcome given the current model coefficients       
+yhat_i <- predict_row(row_vec, coefficients = coefs)
+      
+# for each coefficient, apply update using partial derivative
+coefs <- sapply(1:length(coefs), function (k) {
+  coefs[k] - l_rate*(yhat_i - y[i])*row_vec[k]
+}
+)
+
+# note: sapply() is just a slightly more efficient for loop where we want to "apply" a function to a vector of values separately, and return it as *s*imply as possible (hopefully as a vector!)
+
+```
+
+### Stochastic gradient descent
+
+Now we have the code for a single observation, we need to implement the stochastic component:
+
+1. To iterate through *every* observation in the dataset
+2. To randomise the order in which the function considers the observations
+
+```{r}
+# keep the same coefficient initialization
+coefs = c(0,0,0) # (beta_0,beta_1,beta_2)
+l_rate = 0.01
+
+for (i in sample(1:nrow(X))) { # sampling the indices shuffles the order
+  row_vec <- as.numeric(X[i,]) # make row easier to handle
+  
+  yhat_i <- predict_row(row_vec, coefficients = coefs)
+  
+  # for each coefficient, apply update using partial derivative
+  coefs <- sapply(1:length(coefs), function (k) {
+    coefs[k] - l_rate*(yhat_i - y[i])*row_vec[k]
+  }
+  )
+}
+```
+
+### Repeated updates
+
+Now we've done a single "epoch" or step through the entire data. But it's unlikely that will be enough (especially given that SGD is noisy!) So let's wrap our above code in another for loop, that repeats this process `R` times:
+
+
+```{r}
+# keep the same coefficient initialization
+coefs = c(0,0,0) # (beta_0,beta_1,beta_2)
+l_rate = 0.01
+epochs = 10
+
+for (b in 1:epochs) {
+  for (i in sample(1:nrow(X))) { # sampling the indices shuffles the order
+    row_vec <- as.numeric(X[i,]) # make row easier to handle
+    
+    yhat_i <- predict_row(row_vec, coefficients = coefs)
+    
+    # for each coefficient, apply update using partial derivative
+    coefs <- sapply(1:length(coefs), function (k) {
+      coefs[k] - l_rate*(yhat_i - y[i])*row_vec[k]
+    }
+    )
+  }
+}
+
+```
+
+### Convert our estimator into a function!
+
+Finally, let's convert our code into a function so we could run it on any dataset. Let's call the function `train`, which should take four arguments:
+
+* The training data -- `X`
+* The corresponding outcomes -- `y`
+* A learning rate -- `l_rate`
+* The number of times we run SGD on the data: `epochs`
+
+Also, it would be useful to track the performance of our model, so after every full pass of the data, the function should calculate the MSE and NLL given the current model coefficients, and `message()` these values to the user in an informative way.
+
+Finally, the model should return the final coefficient values as a vector.
+
+
+```{r}
+train <- function(X, y, l_rate, epochs) {
+  # X = training data
+  # y = true outcomes
+  # l_rate = learning rate
+  # reps = number of SGD iterations through X
+  
+  # Instantiate model with basic guess of 0 for all coefficients 
+  coefs <- rep(0, ncol(X))
+  
+  ### OUR CODE BLOCK FROM BEFORE ###
+  for (b in 1:epochs) {
+    for (i in sample(1:nrow(X))) { # sampling the indices shuffles the order
+      row_vec <- as.numeric(X[i,]) # make row easier to handle
+      
+      yhat_i <- predict_row(row_vec, coefficients = coefs)
+      
+      # for each coefficient, apply update using partial derivative
+      coefs <- sapply(1:length(coefs), function (k) {
+        coefs[k] - l_rate*(yhat_i - y[i])*row_vec[k]
+      }
+      )
+    }
+    
+    # calculate current error
+    yhat <- apply(X, 1, predict_row, coefficients = coefs)
+    MSE_epoch <- MSE(y, yhat)
+    NLL_epoch <- NLL(y, yhat)
+    
+    # report the error to the user
+    message(
+      paste0(
+        "Iteration ", b ,"/",epochs," | NLL = ", round(NLL_epoch,5),"; MSE = ", round(MSE_epoch,5)
+      )
+    )
+    
+  }
+  
+  
+  return(coefs) # output the final estimates
+}
+```
+
+#### 4. Apply our algorithm ####
+
+Now we have everything to estimate our logistic regression parameters:
+
+```{r}
+coef_model <- train(X = X, y = y, l_rate = 0.01, epochs = 50)
+```
+
+Notice that quite quickly our error statistics converge on stable parameters, suggesting the training is done. If we now inspect the estimated coefficients themselves, you'll see just how close we got:
+
+```{r}
+print(round(coef_model,3))
+```
+
+How close do we get compared to the built-in logistic estimator?
+
+```{r}
+coef(glm(y ~ X$X1 + X$X2, family = binomial(link = "logit")))
+```
+
+
